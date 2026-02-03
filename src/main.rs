@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use chrono::{DateTime, Utc, FixedOffset};
 use image::GenericImageView;
+use rayon::prelude::*;
 
 #[derive(Clone)]
 struct Post {
@@ -22,7 +23,7 @@ struct ImageResult {
 
 fn main() -> Result<()> {
     let start_time = std::time::Instant::now();
-    println!("Building blog...");
+    println!("Building blog (Multi-threaded)...");
     
     let content_dir = Path::new("../content");
     let public_dir = Path::new("../public");
@@ -37,25 +38,31 @@ fn main() -> Result<()> {
     fs::create_dir_all(&images_dir).context("Failed to create images dir")?;
 
     let entries = fs::read_dir(content_dir).context("Failed to read content dir")?;
-    let mut posts = Vec::new();
-    let mut all_tags = HashSet::new();
+    
+    // Collect all valid markdown paths first
+    let paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+        .collect();
 
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        
-        if path.extension().and_then(|s| s.to_str()) == Some("md") {
+    println!("Found {} markdown files.", paths.len());
+
+    // Pass 1: Parse Metadata & Content (Parallel)
+    // We collect results to separate successes from failures
+    let parsed_results: Vec<Result<(Post, String)>> = paths.par_iter()
+        .map(|path| -> Result<(Post, String)> {
             let file_stem = path.file_stem().unwrap().to_string_lossy().to_string();
             
             // get metadata
-            let metadata = fs::metadata(&path)?;
+            let metadata = fs::metadata(path).with_context(|| format!("Failed to read metadata for {:?}", path))?;
             let modified: DateTime<Utc> = metadata.modified()?.into();
             let offset = FixedOffset::east_opt(8 * 3600).context("Invalid offset")?;
             let modified_gmt8 = modified.with_timezone(&offset);
             
             let date_str = modified_gmt8.format("%Y.%m.%d %H:%M").to_string();
             
-            let markdown_input = fs::read_to_string(&path)?;
+            let markdown_input = fs::read_to_string(path).with_context(|| format!("Failed to read file {:?}", path))?;
             
             // extract title
             let title = markdown_input.lines()
@@ -72,28 +79,93 @@ fn main() -> Result<()> {
                     let t = tag.trim().to_string();
                     if !t.is_empty() {
                         tags.push(t.clone());
-                        all_tags.insert(t);
                     }
                 }
             }
 
-            println!("Processing: {file_stem} [{date_str}] Tags: {tags:?}");
+            // Return Post struct and raw content
+            Ok((
+                Post {
+                    title,
+                    filename: format!("posts/{file_stem}.html"),
+                    date: date_str,
+                    tags,
+                },
+                markdown_input
+            ))
+        })
+        .collect();
 
-            // generate post html
-            let html_output = process_markdown(&markdown_input, &title, &date_str, &tags, &all_tags, "../", content_dir, public_dir)?; 
-            let output_path = posts_dir.join(format!("{file_stem}.html"));
-            fs::write(output_path, html_output)?;
+    let mut valid_posts_data = Vec::new();
+    let mut all_tags = HashSet::new();
+    let mut errors = Vec::new();
 
-            posts.push(Post {
-                title,
-                filename: format!("posts/{file_stem}.html"),
-                date: date_str,
-                tags,
-            });
+    for res in parsed_results {
+        match res {
+            Ok((post, content)) => {
+                for t in &post.tags {
+                    all_tags.insert(t.clone());
+                }
+                valid_posts_data.push((post, content));
+            }
+            Err(e) => errors.push(e),
         }
     }
 
-    // sort posts
+    if !errors.is_empty() {
+        eprintln!("Warning: {} files failed to parse:", errors.len());
+        for e in &errors {
+            eprintln!("  - {:#}", e);
+        }
+        // We continue with valid posts
+    }
+
+    println!("Parsed {} valid posts. Generating HTML...", valid_posts_data.len());
+
+    // Pass 2: Generate HTML (Parallel)
+    // We now have complete `all_tags` for consistent navigation
+    let build_results: Vec<Result<()>> = valid_posts_data.par_iter()
+        .map(|(post, markdown_input)| -> Result<()> {
+            let file_stem = Path::new(&post.filename)
+                .file_stem().unwrap().to_string_lossy();
+
+            println!("Processing: {} [{}] Tags: {:?}", post.title, post.date, post.tags);
+
+            let html_output = process_markdown(
+                markdown_input, 
+                &post.title, 
+                &post.date, 
+                &post.tags, 
+                &all_tags, 
+                "../", 
+                content_dir, 
+                public_dir
+            ).with_context(|| format!("Failed to process markdown for {}", post.title))?; 
+            
+            let output_path = posts_dir.join(format!("{}.html", file_stem));
+            fs::write(&output_path, html_output).with_context(|| format!("Failed to write html for {}", post.title))?;
+            
+            Ok(())
+        })
+        .collect();
+
+    let mut build_errors = Vec::new();
+    for res in build_results {
+        if let Err(e) = res {
+            build_errors.push(e);
+        }
+    }
+
+    if !build_errors.is_empty() {
+        eprintln!("Error: {} posts failed to build:", build_errors.len());
+        for e in &build_errors {
+            eprintln!("  - {:#}", e);
+        }
+    }
+
+    // sort posts for index
+    // We need just the Post structs now
+    let mut posts: Vec<Post> = valid_posts_data.into_iter().map(|(p, _)| p).collect();
     posts.sort_by(|a, b| b.filename.cmp(&a.filename));
 
     // generate main index
@@ -113,6 +185,13 @@ fn main() -> Result<()> {
     
     let duration = start_time.elapsed();
     println!("Done! Built in {duration:.2?}");
+    
+    // Return error if critical failures occurred, otherwise Ok
+    if !errors.is_empty() || !build_errors.is_empty() {
+        // Optional: return generic error or just Ok if partial success is allowed
+        // returning Ok to indicate "process finished", assuming logs are enough.
+    }
+    
     Ok(())
 }
 

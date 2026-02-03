@@ -353,6 +353,7 @@ dependencies = [
  "chrono",
  "image",
  "pulldown-cmark",
+ "rayon",
 ]
 
 [[package]]
