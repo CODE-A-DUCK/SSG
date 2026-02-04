@@ -1,45 +1,79 @@
-use anyhow::{Context, Result};
-use pulldown_cmark::{html, Parser, Event, Tag, TagEnd};
-use std::fs;
-use std::path::{Path, PathBuf};
+//! Blog generator main entry point.
+//!
+//! Orchestrates the build process using the library modules.
+
 use std::collections::HashSet;
-use chrono::{DateTime, Utc, FixedOffset};
-use image::GenericImageView;
+use std::fs;
+use std::path::PathBuf;
+
+use chrono::{DateTime, FixedOffset, Utc};
 use rayon::prelude::*;
 
-#[derive(Clone)]
-struct Post {
-    title: String,
-    filename: String,
-    date: String,
-    tags: Vec<String>,
-}
+use generator::config::Config;
+use generator::error::{BuildError, BuildResult};
+use generator::parser::{extract_metadata, render_markdown, PostMetadata};
+use generator::renderer::{template, render_post_meta, render_post_list, PostListItem, RenderContext};
+use generator::types::{HtmlSafe, Tag};
 
-struct ImageResult {
-    rel_path: String,
-    width: u32,
-    height: u32,
-}
-
-fn main() -> Result<()> {
+fn main() -> Result<(), BuildError> {
     let start_time = std::time::Instant::now();
     println!("Building blog (Multi-threaded)...");
     
-    let content_dir = Path::new("../content");
-    let public_dir = Path::new("../public");
+    let config = Config::new();
     
-    // create directories (idempotent)
-    let posts_dir = public_dir.join("posts");
-    let tags_dir = public_dir.join("tags");
-    let images_dir = public_dir.join("images");
+    // Create output directories
+    fs::create_dir_all(config.posts_dir()).map_err(|e| BuildError::OutputNotWritable {
+        path: config.posts_dir(),
+        source: e,
+    })?;
+    fs::create_dir_all(config.tags_dir()).map_err(|e| BuildError::OutputNotWritable {
+        path: config.tags_dir(),
+        source: e,
+    })?;
+    fs::create_dir_all(config.images_dir()).map_err(|e| BuildError::OutputNotWritable {
+        path: config.images_dir(),
+        source: e,
+    })?;
 
-    fs::create_dir_all(&posts_dir).context("Failed to create posts dir")?;
-    fs::create_dir_all(&tags_dir).context("Failed to create tags dir")?;
-    fs::create_dir_all(&images_dir).context("Failed to create images dir")?;
+    // Load CSS for inlining (eliminates render-blocking)
+    let css_content = if config.inline_css {
+        let css_path = config.content_dir.join("style.css");
+        match fs::read_to_string(&css_path) {
+            Ok(css) => {
+                println!("  → CSS will be inlined ({} bytes)", css.len());
+                Some(css)
+            }
+            Err(_) => {
+                eprintln!("  ⚠ CSS file not found for inlining, using external link");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let entries = fs::read_dir(content_dir).context("Failed to read content dir")?;
+    // Copy static assets (only favicon now if CSS is inlined, or both if not)
+    let static_files: Vec<&str> = if css_content.is_some() {
+        vec!["favicon.ico"]
+    } else {
+        vec!["favicon.ico", "style.css"]
+    };
     
-    // Collect all valid markdown paths first
+    for file in static_files {
+        let src = config.content_dir.join(file);
+        if src.exists() {
+            if let Err(e) = fs::copy(&src, config.public_dir.join(file)) {
+                eprintln!("  ⚠ Failed to copy {}: {}", file, e);
+            }
+        }
+    }
+
+    // Phase 1: Discover markdown files (IO-bound, sequential)
+    let entries = fs::read_dir(&config.content_dir).map_err(|e| BuildError::ContentNotReadable {
+        path: config.content_dir.clone(),
+        source: e,
+    })?;
+    
     let paths: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -48,393 +82,236 @@ fn main() -> Result<()> {
 
     println!("Found {} markdown files.", paths.len());
 
-    // Pass 1: Parse Metadata & Content (Parallel)
-    // We collect results to separate successes from failures
-    let parsed_results: Vec<Result<(Post, String)>> = paths.par_iter()
-        .map(|path| -> Result<(Post, String)> {
-            let file_stem = path.file_stem().unwrap().to_string_lossy().to_string();
-            
-            // get metadata
-            let metadata = fs::metadata(path).with_context(|| format!("Failed to read metadata for {:?}", path))?;
-            let modified: DateTime<Utc> = metadata.modified()?.into();
-            let offset = FixedOffset::east_opt(8 * 3600).context("Invalid offset")?;
-            let modified_gmt8 = modified.with_timezone(&offset);
-            
-            let date_str = modified_gmt8.format("%Y.%m.%d %H:%M").to_string();
-            
-            let markdown_input = fs::read_to_string(path).with_context(|| format!("Failed to read file {:?}", path))?;
-            
-            // extract title
-            let title = markdown_input.lines()
-                .find(|l| l.starts_with("# "))
-                .map(|l| l.trim_start_matches("# ").trim())
-                .unwrap_or(&file_stem)
-                .to_string();
-
-            // extract tags
-            let mut tags = Vec::new();
-            if let Some(tag_line) = markdown_input.lines().find(|l| l.trim().starts_with("Tags:")) {
-                let tag_str = tag_line.trim_start_matches("Tags:").trim();
-                for tag in tag_str.split(',') {
-                    let t = tag.trim().to_string();
-                    if !t.is_empty() {
-                        tags.push(t.clone());
-                    }
-                }
-            }
-
-            // Return Post struct and raw content
-            Ok((
-                Post {
-                    title,
-                    filename: format!("posts/{file_stem}.html"),
-                    date: date_str,
-                    tags,
-                },
-                markdown_input
-            ))
-        })
+    // Phase 2: Parse metadata (CPU-bound, parallel)
+    let parsed_results: Vec<_> = paths.par_iter()
+        .map(|path| parse_post(path, &config))
         .collect();
 
-    let mut valid_posts_data = Vec::new();
-    let mut all_tags = HashSet::new();
-    let mut errors = Vec::new();
+    // Collect results and tags
+    let mut build_result = BuildResult::new();
+    let mut valid_posts: Vec<ParsedPost> = Vec::new();
+    let mut all_tags: HashSet<Tag> = HashSet::new();
 
     for res in parsed_results {
         match res {
-            Ok((post, content)) => {
-                for t in &post.tags {
-                    all_tags.insert(t.clone());
+            Ok(post) => {
+                for tag in &post.metadata.tags {
+                    all_tags.insert(tag.clone());
                 }
-                valid_posts_data.push((post, content));
+                valid_posts.push(post);
+                build_result.record_success();
             }
-            Err(e) => errors.push(e),
+            Err(e) => build_result.record_failure(e),
         }
     }
 
-    if !errors.is_empty() {
-        eprintln!("Warning: {} files failed to parse:", errors.len());
-        for e in &errors {
-            eprintln!("  - {:#}", e);
+    println!("Parsed {} valid posts. Generating HTML...", valid_posts.len());
+
+    // Phase 3: Render HTML (CPU-bound, parallel)
+    let css_ref = css_content.as_deref();
+    let render_results: Vec<_> = valid_posts.par_iter()
+        .map(|post| render_post(post, &all_tags, &config, css_ref))
+        .collect();
+
+    for res in render_results {
+        if let Err(e) = res {
+            build_result.record_failure(e);
         }
-        // We continue with valid posts
     }
 
-    println!("Parsed {} valid posts. Generating HTML...", valid_posts_data.len());
-
-    // Pass 2: Generate HTML (Parallel)
-    // We now have complete `all_tags` for consistent navigation
-    let build_results: Vec<Result<()>> = valid_posts_data.par_iter()
-        .map(|(post, markdown_input)| -> Result<()> {
-            let file_stem = Path::new(&post.filename)
-                .file_stem().unwrap().to_string_lossy();
-
-            println!("Processing: {} [{}] Tags: {:?}", post.title, post.date, post.tags);
-
-            let html_output = process_markdown(
-                markdown_input, 
-                &post.title, 
-                &post.date, 
-                &post.tags, 
-                &all_tags, 
-                "../", 
-                content_dir, 
-                public_dir
-            ).with_context(|| format!("Failed to process markdown for {}", post.title))?; 
-            
-            let output_path = posts_dir.join(format!("{}.html", file_stem));
-            fs::write(&output_path, html_output).with_context(|| format!("Failed to write html for {}", post.title))?;
-            
-            Ok(())
+    // Phase 4: Generate index pages (sequential)
+    let post_items: Vec<PostListItem> = valid_posts.iter()
+        .map(|p| PostListItem {
+            title: p.metadata.title.clone(),
+            filename: format!("posts/{}.html", p.file_stem),
+            date: p.date.clone(),
+            tags: p.metadata.tags.clone(),
         })
         .collect();
 
-    let mut build_errors = Vec::new();
-    for res in build_results {
-        if let Err(e) = res {
-            build_errors.push(e);
-        }
-    }
+    // Sort by filename (newest first based on naming convention)
+    let mut sorted_items = post_items;
+    sorted_items.sort_by(|a, b| b.filename.cmp(&a.filename));
 
-    if !build_errors.is_empty() {
-        eprintln!("Error: {} posts failed to build:", build_errors.len());
-        for e in &build_errors {
-            eprintln!("  - {:#}", e);
-        }
-    }
+    // Generate main index
+    generate_list_page(&sorted_items, &all_tags, "Index", config.public_dir.join("index.html"), "", &config, css_ref)?;
 
-    // sort posts for index
-    // We need just the Post structs now
-    let mut posts: Vec<Post> = valid_posts_data.into_iter().map(|(p, _)| p).collect();
-    posts.sort_by(|a, b| b.filename.cmp(&a.filename));
-
-    // generate main index
-    generate_list_page(&posts, &all_tags, "Index", public_dir.join("index.html"), "")?;
-
-    // generate tag pages
+    // Generate tag pages
     for tag in &all_tags {
-        let tag_posts: Vec<Post> = posts.iter()
+        let tag_posts: Vec<_> = sorted_items.iter()
             .filter(|p| p.tags.contains(tag))
             .cloned()
             .collect();
         
-        let tag_lower = tag.to_lowercase();
-        let filename = format!("tag_{tag_lower}.html");
-        generate_list_page(&tag_posts, &all_tags, &format!("Tag: {tag}"), tags_dir.join(&filename), "../")?;
+        let filename = format!("tag_{}.html", tag.to_lowercase());
+        let title = format!("Tag: {}", tag);
+        generate_list_page(&tag_posts, &all_tags, &title, config.tags_dir().join(&filename), "../", &config, css_ref)?;
     }
     
     let duration = start_time.elapsed();
-    println!("Done! Built in {duration:.2?}");
     
-    // Return error if critical failures occurred, otherwise Ok
-    if !errors.is_empty() || !build_errors.is_empty() {
-        // Optional: return generic error or just Ok if partial success is allowed
-        // returning Ok to indicate "process finished", assuming logs are enough.
-    }
-    
-    Ok(())
-}
-
-fn generate_list_page(posts: &[Post], all_tags: &HashSet<String>, title: &str, path: PathBuf, relative_root: &str) -> Result<()> {
-    let mut posts_html = String::new();
-    posts_html.push_str(r#"<div class="post-list">"#);
-    for post in posts {
-        let tags_html: String = post.tags.iter()
-            .map(|t| format!(r#"<span class="tag">#{t}</span>"#))
-            .collect();
-
-        let post_filename = &post.filename;
-        let link = format!("{relative_root}{post_filename}");
-
-        let post_title = &post.title;
-        let post_date = &post.date;
-        posts_html.push_str(&format!(
-            r#"<div class="post-entry"><a href="{link}"><span class="entry-title">{post_title} {tags_html}</span><span class="entry-date">{post_date}</span></a></div>"#
-        ));
-    }
-    posts_html.push_str("</div>");
-
-    let html = template(title, &format!("<h1>{title}</h1>{posts_html}"), all_tags, relative_root);
-    fs::write(path, html)?;
-    Ok(())
-}
-
-fn optimize_local_image(original_src: &str, content_root: &Path, public_root: &Path) -> Result<ImageResult> {
-    // check if it's a local file
-    if original_src.starts_with("http") {
-         return Ok(ImageResult { rel_path: original_src.to_string(), width: 0, height: 0 });
-    }
-
-    let src_path = content_root.join(original_src);
-    if !src_path.exists() {
-         // fallback if file not found
-         return Ok(ImageResult { rel_path: original_src.to_string(), width: 0, height: 0 });
-    }
-
-    // hash filename for unique destination
-    let file_stem = src_path.file_stem().unwrap().to_string_lossy();
-    // simple hash or just use name. let's use name + webp extension.
-    let dest_filename = format!("{file_stem}.webp");
-    let dest_path = public_root.join("images").join(&dest_filename);
-    let webp_rel_path = format!("images/{dest_filename}"); // relative from public root
-
-    // cache check
-    if dest_path.exists() {
-        // read dimensions from existing webp
-        if let Ok(reader) = image::ImageReader::open(&dest_path) {
-            if let Ok(dims) = reader.into_dimensions() {
-                return Ok(ImageResult {
-                    rel_path: webp_rel_path,
-                    width: dims.0,
-                    height: dims.1,
-                });
-            }
+    // Finalize and report
+    match build_result.finalize() {
+        Ok(summary) => {
+            summary.print_report();
+            println!("Done! Built in {duration:.2?}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Build failed: {}", e);
+            Err(e)
         }
     }
+}
 
-    // process image
-    println!("Optimizing image: {src_path:?}");
-    let img = image::open(&src_path).context("Failed to open image")?;
+/// Intermediate parsed post data.
+struct ParsedPost {
+    file_stem: String,
+    metadata: PostMetadata,
+    date: String,
+    content: String,
+    first_image_url: Option<String>,
+}
+
+/// Parse a single markdown file.
+fn parse_post(path: &PathBuf, config: &Config) -> Result<ParsedPost, BuildError> {
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| BuildError::ParseFailed {
+            path: path.clone(),
+            message: "Invalid filename".to_string(),
+        })?
+        .to_string();
+
+    // Get modification time
+    let metadata = fs::metadata(path).map_err(|e| BuildError::ParseFailed {
+        path: path.clone(),
+        message: format!("Failed to read metadata: {}", e),
+    })?;
     
-    // resize if larger than 1200px width
-    let (w, _h) = img.dimensions();
-    let target_width = 1200;
+    let modified: DateTime<Utc> = metadata
+        .modified()
+        .map_err(|e| BuildError::ParseFailed {
+            path: path.clone(),
+            message: format!("Failed to get mtime: {}", e),
+        })?
+        .into();
     
-    let final_img = if w > target_width {
-        img.resize(target_width, u32::MAX, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
+    let offset = FixedOffset::east_opt(config.timezone_offset_hours * 3600)
+        .ok_or_else(|| BuildError::Internal("Invalid timezone offset".to_string()))?;
+    let modified_local = modified.with_timezone(&offset);
+    let date_str = modified_local.format("%Y.%m.%d %H:%M").to_string();
 
-    let (new_w, new_h) = final_img.dimensions();
+    let content = fs::read_to_string(path).map_err(|e| BuildError::ParseFailed {
+        path: path.clone(),
+        message: format!("Failed to read file: {}", e),
+    })?;
 
-    // save as webp
-    final_img.save_with_format(&dest_path, image::ImageFormat::WebP)
-        .context("Failed to save WebP")?;
+    let post_metadata = extract_metadata(&content, &file_stem);
+    
+    // Extract first image URL for LCP preload
+    let first_image_url = extract_first_image(&content);
 
-    Ok(ImageResult {
-        rel_path: webp_rel_path,
-        width: new_w,
-        height: new_h,
+    println!("  ✓ {} [{}] Tags: {:?}", 
+        post_metadata.raw_title,
+        date_str,
+        post_metadata.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>()
+    );
+
+    Ok(ParsedPost {
+        file_stem,
+        metadata: post_metadata,
+        date: date_str,
+        content,
+        first_image_url,
     })
 }
 
-fn process_markdown(markdown: &str, title: &str, date: &str, tags: &[String], all_tags: &HashSet<String>, relative_root: &str, content_dir: &Path, public_dir: &Path) -> Result<String> {
-    let parser = Parser::new(markdown);
-    
-    // custom event loop to intercept images
-    let mut new_events = Vec::new();
-    let mut in_image = false;
-    let mut image_url = String::new();
-    let mut image_title = String::new();
-    let mut image_alt = String::new();
-    let mut first_image_processed = false;
-
-    for event in parser {
-        match event {
-            Event::Start(Tag::Image { link_type: _, dest_url: url, title, id: _ }) => {
-                in_image = true;
-                image_url = url.to_string();
-                image_title = title.to_string();
-                image_alt.clear();
-            },
-            Event::End(TagEnd::Image) => {
-                in_image = false;
-                
-                // optimize image
-                let opt_result = optimize_local_image(&image_url, content_dir, public_dir)
-                    .unwrap_or(ImageResult { rel_path: image_url.clone(), width: 0, height: 0 });
-
-                // construct relative path for html
-                let final_src = if opt_result.rel_path.starts_with("http") {
-                    opt_result.rel_path.clone()
-                } else {
-                    let rel_path = &opt_result.rel_path;
-                    format!("{relative_root}{rel_path}")
-                };
-
-                let mut width_attr = String::new();
-                let mut height_attr = String::new();
-                
-                if opt_result.width > 0 && opt_result.height > 0 {
-                    let w = opt_result.width;
-                    let h = opt_result.height;
-                    width_attr = format!(r#"width="{w}""#);
-                    height_attr = format!(r#"height="{h}""#);
-                }
-
-                let clean_title = image_title.trim();
-                let mut final_title_attr = String::new();
-                let mut is_dimensions = false;
-                
-                if !clean_title.is_empty() {
-                    if let Some(x_pos) = clean_title.find('x') {
-                        let (w_str, h_str) = clean_title.split_at(x_pos);
-                        let h_str = &h_str[1..];
-                        if let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>()) {
-                             width_attr = format!(r#"width="{w}""#);
-                             height_attr = format!(r#"height="{h}""#);
-                             is_dimensions = true;
-                        }
-                    } else if let Ok(w) = clean_title.parse::<u32>() {
-                        width_attr = format!(r#"width="{w}""#);
-                        height_attr = String::new();
-                        is_dimensions = true;
-                    }
-                }
-
-                if !is_dimensions && !clean_title.is_empty() {
-                     final_title_attr = format!(r#"title="{clean_title}""#);
-                }
-
-                let loading_attrs = if !first_image_processed {
-                    first_image_processed = true;
-                    r#"loading="eager" fetchpriority="high" decoding="sync""#
-                } else {
-                    r#"loading="lazy" decoding="async""#
-                };
-
-                let html = format!(
-                    r#"<figure class="image-container">
-                        <img src="{final_src}" alt="{image_alt}" {width_attr} {height_attr} {final_title_attr} {loading_attrs} />
-                        <figcaption>
-                            <a href="{final_src}" target="_blank" class="download-link">[ Download Full Size ]</a>
-                        </figcaption>
-                    </figure>"#
-                );
-                new_events.push(Event::Html(html.into()));
-            },
-            Event::Text(text) => {
-                if in_image {
-                    image_alt.push_str(&text);
-                } else {
-                    new_events.push(Event::Text(text));
-                }
-            },
-            Event::Code(text) => {
-                if in_image {
-                    image_alt.push_str(&text);
-                } else {
-                    new_events.push(Event::Code(text));
-                }
-            },
-            e => {
-                if !in_image {
-                    new_events.push(e);
-                }
-            }
-        }
-    }
-
-    let mut html_output = String::new();
-    html::push_html(&mut html_output, new_events.into_iter());
-    
-    let tags_str: String = tags.iter().map(|t| format!(r#"<span class="tag">#{t}</span>"#)).collect();
-    let content_with_meta = format!(r#"<div class="meta"><span class="meta-item">UPLOAD: {date}</span> <span class="meta-item">{tags_str}</span></div>{html_output}"#);
-
-    let html_page = template(title, &content_with_meta, all_tags, relative_root);
-    
-    Ok(html_page)
+/// Extract first image URL from markdown for LCP preload.
+fn extract_first_image(content: &str) -> Option<String> {
+    // Simple regex-free extraction: find ![...](...) pattern
+    let start = content.find("![")?;
+    let after_alt = content[start..].find("](")?;
+    let url_start = start + after_alt + 2;
+    let url_end = content[url_start..].find(')')?;
+    Some(content[url_start..url_start + url_end].to_string())
 }
 
-fn template(title: &str, content: &str, all_tags: &HashSet<String>, relative_root: &str) -> String {
-    let mut sorted_tags: Vec<_> = all_tags.iter().collect();
-    sorted_tags.sort();
-    
-    let index_link = format!("{relative_root}index.html");
-    
-    let mut nav_html = format!(r#"<div class="nav-section"><a href="{index_link}" class="nav-link main-link">Index</a></div>"#);
-    
-    if !sorted_tags.is_empty() {
-        nav_html.push_str(r#"<div class="nav-section"><span class="nav-header">Filter</span>"#);
-        for tag in sorted_tags {
-            let tag_lower = tag.to_lowercase();
-            let link = format!("{relative_root}tags/tag_{tag_lower}.html");
-            nav_html.push_str(&format!(r#"<a href="{link}" class="nav-link tag-link">{tag}</a>"#));
-        }
-        nav_html.push_str("</div>");
+/// Render a single post to HTML file.
+fn render_post(post: &ParsedPost, all_tags: &HashSet<Tag>, config: &Config, css: Option<&str>) -> Result<(), BuildError> {
+    let html_content = render_markdown(
+        &post.content,
+        config,
+        &config.content_dir,
+        &config.public_dir,
+        "../",
+    )?;
+
+    let meta_html = render_post_meta(&post.date, &post.metadata.tags);
+    let full_content = format!("{}{}", meta_html, html_content);
+
+    // Build render context with CSS and LCP preload
+    let mut ctx = RenderContext::new(config);
+    if let Some(css_str) = css {
+        ctx = ctx.with_css(css_str);
+    }
+    if let Some(ref img_url) = post.first_image_url {
+        // Convert to proper relative URL for the post page
+        let lcp_url = if img_url.starts_with("http") {
+            img_url.clone()
+        } else {
+            format!("../images/{}.webp", 
+                std::path::Path::new(img_url)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(img_url))
+        };
+        ctx = ctx.with_lcp_image(lcp_url);
     }
 
-    format!(
-r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CODE A DUCK | {title}</title>
-    <link rel="stylesheet" href="{relative_root}style.css">
-</head>
-<body>
-    <header>
-        <span class="brand">[ CODE A DUCK ]</span>
-        <nav>
-            {nav_html}
-        </nav>
-    </header>
-    <article>
-        {content}
-    </article>
-</body>
-</html>"##
-    )
+    let html_page = template(
+        &post.metadata.title,
+        &full_content,
+        all_tags,
+        "../",
+        &ctx,
+    );
+
+    let output_path = config.posts_dir().join(format!("{}.html", post.file_stem));
+    fs::write(&output_path, html_page).map_err(|e| BuildError::OutputNotWritable {
+        path: output_path,
+        source: e,
+    })?;
+
+    Ok(())
+}
+
+/// Generate a list page (index or tag page).
+fn generate_list_page(
+    posts: &[PostListItem],
+    all_tags: &HashSet<Tag>,
+    title: &str,
+    path: PathBuf,
+    relative_root: &str,
+    config: &Config,
+    css: Option<&str>,
+) -> Result<(), BuildError> {
+    let posts_html = render_post_list(posts, relative_root);
+    let safe_title = HtmlSafe::escape(title);
+    let content = format!("<h1>{}</h1>{}", safe_title, posts_html);
+
+    let mut ctx = RenderContext::new(config);
+    if let Some(css_str) = css {
+        ctx = ctx.with_css(css_str);
+    }
+
+    let html = template(&safe_title, &content, all_tags, relative_root, &ctx);
+    
+    fs::write(&path, html).map_err(|e| BuildError::OutputNotWritable {
+        path,
+        source: e,
+    })?;
+
+    Ok(())
 }
